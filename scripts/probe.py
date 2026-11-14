@@ -14,6 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
+from rich import box
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
 
 TARGETS = {
     'binance': ('https://fapi.binance.com/fapi/v1/time',
@@ -253,24 +258,43 @@ async def main(args):
                 print(f'{name}: REST 测试中...', flush=True)
                 result = await rest(name, url, args, emit)
             result['hosts'] = probes
-            print(f'{name}: WebSocket 测试 {args.duration}s...', flush=True)
+            if not args.fast:
+                console.print(f'{name}: WebSocket 测试 {args.duration}s...')
             result.update(await websocket(name, ws_template.format(symbol=args.symbol.lower()),
                                           args, result['clock_offset_estimate_ms'], emit))
             return name, result
-        results = dict(await asyncio.gather(*(venue(n) for n in TARGETS)))
+        if args.fast:
+            with console.status(f'正在测试 Binance / Aster WebSocket · {args.duration} 秒', spinner='dots'):
+                results = dict(await asyncio.gather(*(venue(n) for n in TARGETS)))
+        else:
+            results = dict(await asyncio.gather(*(venue(n) for n in TARGETS)))
     summary = {'metadata': metadata, 'results': results}
     (folder/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n')
+    table = Table(title=f"WebSocket 测速 · {args.label} · {args.duration} 秒",
+                  caption="延迟单位：ms（毫秒）", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("交易所", style="bold", no_wrap=True)
+    for column in ("握手", "Ping 中位", "Ping 最大", "样本", "行情", "状态"):
+        table.add_column(column, justify="right", no_wrap=True)
+    def ms(value):
+        return f"{value:.1f}" if value is not None else "—"
+    for name, r in results.items():
+        ping = r['ws_ping_rtt']
+        if r['ws_errors']:
+            status = f"[red]{r['ws_errors']} 次错误[/red]"
+        elif not r['ws_messages']:
+            status = "[yellow]未收到行情[/yellow]"
+        elif not ping['n']:
+            status = "[yellow]无 Pong 样本[/yellow]"
+        else:
+            status = "[green]正常[/green]"
+        table.add_row(name.capitalize(), ms(r['ws_handshake'].get('p50_ms')),
+                      ms(ping.get('p50_ms')), ms(ping.get('max_ms')),
+                      str(ping['n']), str(r['ws_messages']), status)
+    console.print(table)
     if args.fast:
-        print('交易所 | WS握手ms | Ping样本 | Ping P50ms | Ping最大ms | 行情数 | 错误数')
-        for name, r in results.items():
-            ping = r['ws_ping_rtt']
-            print(f"{name} | {r['ws_handshake'].get('p50_ms', 'NA')} | {ping['n']} | "
-                  f"{ping.get('p50_ms', 'NA')} | {ping.get('max_ms', 'NA')} | "
-                  f"{r['ws_messages']} | {r['ws_errors']}")
-        print('快速初筛：小样本不能代表长期稳定性；完整分位数保存在 summary.json。')
-    else:
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-    print(f'结果目录: {folder}')
+        console.print("[dim]短测用于初筛，入围服务器建议再做长测。[/dim]")
+    console.print("结果：", str(folder), style="dim", markup=False)
+
 
 
 if __name__ == '__main__':
