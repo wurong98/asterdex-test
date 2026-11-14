@@ -19,12 +19,12 @@ git clone https://github.com/wurong98/asterdex-test.git && cd asterdex-test && .
 新加坡主机使用 `--label aws-singapore`。已克隆时直接：
 
 ```bash
-./run.sh --label aws-tokyo --duration 1800 --samples 200
+./run.sh --label aws-tokyo --duration 1800
 ```
 
 首先对 `fapi.binance.com`、`fstream.binance.com`、`fapi.asterdex.com`、`fstream.asterdex.com` 四个域名单独执行 DNS 和最多三次 HTTPS 探测（遭拒绝或限流提前停止），记录连接 IP、TCP（含本次 DNS）和 TLS 耗时、HTTP 状态、CDN 响应头；根路径状态仅用于传输诊断，403/404 不代表有效接口可用。详情也写入 summary.json 的 hosts 字段。
 
-默认两个交易所并行测试，各自先采样 60 次 REST，再接收 300 秒 BTCUSDT 聚合成交。默认总耗时约 6 分钟，网络超时会延长。虚拟环境仅创建在项目内；关闭环境代理，测直接公网路径。参数 `--symbol ETHUSDT` 可换币对。
+默认两个交易所并行进行 WS 测试，接收 300 秒 BTCUSDT 聚合成交，每 5 秒发送带唯一载荷的协议 Ping，匹配 Pong 测量 WS RTT，并自动回复服务端 Ping。默认约 5 分钟，前置诊断和网络超时会延长。REST 仅在加 `--rest` 时运行（默认 60 次，排除首个请求）。虚拟环境仅创建在项目内；关闭环境代理，测直接公网路径。参数 `--symbol ETHUSDT` 可换币对。
 
 ## 结果
 
@@ -43,9 +43,11 @@ python3 scripts/compare.py collected/*/summary.json
 
 ## 指标能证明什么
 
+- **WS ping RTT**：同一条真实 WS 长连接的 Ping/Pong 往返耗时，输出 P50/P95/P99；测的是 WS 服务端返回控制帧的路径，不能证明到达撮合系统。优先比较这个指标及断线数、实际消息数。未返回匹配 Pong 时样本数为零，不能当成 0ms。
+- **raw_event_age**：本地接收时间减行情 `E`，未校正，依赖本机及交易所时钟同步。
 - **REST RTT**：有效 `/time` 请求的完整往返时间。排除第一个请求，尝试复用连接；服务器主动断连后的重建也会计入。不能证明请求到达撮合引擎。
 - **WS handshake**：DNS、TCP、TLS 和 HTTP Upgrade 的总时间，不是订单延迟。
-- **estimated_event_age**：本地接收时间加估计时钟偏移再减行情 `E`。偏移来自 RTT 最小的 `/time` 请求中点，只是近似，受路径不对称、时钟漂移和服务端时钟差异影响；负值保留。NTP 状态也会记录。不能当作精确单向网络延迟。
+- **estimated_event_age**：本地接收时间加估计时钟偏移再减行情 `E`。仅启用 `--rest` 后提供；偏移来自 RTT 最小的 `/time` 请求中点，只是近似，受路径不对称、时钟漂移和服务端时钟差异影响；负值保留。NTP 状态也会记录。不能当作精确单向网络延迟。
 - **WS interarrival**：相邻行情消息到达间隔，包含市场成交疏密和交易所聚合行为，不能直接称作网络抖动或丢包率。WS 错误次数也不等于行情丢失数量。
 - **DNS / CDN POP**：说明公开接入点，不能定位撮合系统。脚本不寻找或绕过 CDN 源站。
 
@@ -69,3 +71,14 @@ python3 scripts/compare.py collected/*/summary.json
 - [Binance 官方低延迟服务](https://www.binance.com/en/support/faq/detail/7df7f3838c3b49e692d175374c3a3283)。
 
 Python 3.12（Ubuntu 24 默认）适用。依赖见 requirements.txt。无需 root 运行测试，仅首次系统依赖安装需要 sudo。
+
+## 实际 WS 入口
+
+默认使用官方文档所述合约聚合成交流：
+
+```text
+Binance: wss://fstream.binance.com/market/ws/btcusdt@aggTrade
+Aster:   wss://fstream.asterdex.com/ws/btcusdt@aggTrade
+```
+
+可用 `--binance-ws-url`、`--aster-ws-url` 覆盖为实际策略使用的公开 aggTrade 流地址（可用 `{symbol}` 占位符）。当前解析器仅统计 aggTrade，其他类型消息不计为有效行情。请勿输入带 listenKey、签名等敏感参数的账户流地址，URL 会写入本地结果。WS 发单接口与行情接口也可能位于不同网关；本工具不测 WS 发单。

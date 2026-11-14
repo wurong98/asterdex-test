@@ -141,7 +141,7 @@ async def rest(name, url, args, emit):
 
 
 async def websocket(name, url, args, offset, emit):
-    ages, gaps, handshakes = [], [], []
+    ages, raw_ages, gaps, handshakes, ping_rtts, first_events = [], [], [], [], [], []
     count, disconnects, attempts = 0, 0, 0
     deadline = time.monotonic()+args.duration
     async with aiohttp.ClientSession(trust_env=False,
@@ -151,21 +151,38 @@ async def websocket(name, url, args, offset, emit):
             last = None
             started = time.perf_counter()
             try:
-                async with session.ws_connect(url, heartbeat=20, autoping=True,
+                async with session.ws_connect(url, autoping=False,
                                               timeout=aiohttp.ClientWSTimeout(ws_close=5)) as ws:
                     handshake = (time.perf_counter()-started)*1000
                     handshakes.append(handshake)
                     emit({'kind': 'ws_connected', 'exchange': name,
-                          'url': url, 'handshake_ms': handshake})
+                          'url': url, 'handshake_ms': handshake,
+                          'remote_peer': ws.get_extra_info('peername')})
+                    next_ping, pending, first = time.monotonic(), {}, True
                     while time.monotonic() < deadline:
+                        now_mono = time.monotonic()
+                        if now_mono >= next_ping:
+                            token = str(time.perf_counter_ns()).encode()
+                            pending = {token: time.perf_counter()}
+                            await ws.ping(token)
+                            next_ping = now_mono+5
                         try:
-                            msg = await asyncio.wait_for(ws.receive(), min(15, deadline-time.monotonic()))
+                            msg = await asyncio.wait_for(ws.receive(), max(0.001, min(next_ping-time.monotonic(), deadline-time.monotonic())))
                         except asyncio.TimeoutError:
                             if time.monotonic() >= deadline:
                                 break
-                            emit({'kind': 'ws_idle', 'exchange': name, 'seconds': 15})
                             continue
                         now, wall = time.perf_counter(), time.time()*1000
+                        if msg.type == aiohttp.WSMsgType.PING:
+                            await ws.pong(msg.data)
+                            continue
+                        if msg.type == aiohttp.WSMsgType.PONG:
+                            sent = pending.pop(bytes(msg.data), None)
+                            if sent is not None:
+                                rtt = (now-sent)*1000
+                                ping_rtts.append(rtt)
+                                emit({'kind': 'ws_ping_rtt', 'exchange': name, 'rtt_ms': rtt})
+                            continue
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = json.loads(msg.data)
@@ -175,6 +192,9 @@ async def websocket(name, url, args, offset, emit):
                                 event = data.get('E')
                             except (ValueError, AttributeError):
                                 continue
+                            if first:
+                                first_events.append((now-started)*1000)
+                                first = False
                             count += 1
                             row = {'kind': 'ws_event', 'exchange': name, 'received_ms': wall,
                                    'event_ms': event, 'trade_id': data.get('a')}
@@ -185,6 +205,7 @@ async def websocket(name, url, args, offset, emit):
                             last = now
                             if isinstance(event, (int, float)):
                                 row['raw_event_age_ms'] = wall-event
+                                raw_ages.append(wall-event)
                                 if offset is not None:
                                     age = wall+offset-event
                                     ages.append(age)
@@ -200,7 +221,9 @@ async def websocket(name, url, args, offset, emit):
                     break
                 await asyncio.sleep(min(3, max(0, deadline-time.monotonic())))
     return {'ws_messages': count, 'ws_data_received': count > 0, 'ws_attempts': attempts, 'ws_errors': disconnects,
-            'ws_handshake': stats(handshakes), 'ws_interarrival': stats(gaps),
+            'ws_handshake': stats(handshakes), 'ws_ping_rtt': stats(ping_rtts),
+            'raw_event_age': stats(raw_ages), 'first_event_since_connect_start': stats(first_events),
+            'ws_interarrival': stats(gaps),
             'estimated_event_age': stats(ages)}
 
 
@@ -219,10 +242,13 @@ async def main(args):
         emit({'kind': 'metadata', **metadata})
         async def venue(name):
             url, ws_template = TARGETS[name]
+            ws_template = getattr(args, name+'_ws_url') or ws_template
             hosts = (url.split('/')[2], ws_template.split('/')[2])
             probes = dict(zip(hosts, await asyncio.gather(*(host_probe(h, name, emit) for h in hosts))))
-            print(f'{name}: REST 测试中...', flush=True)
-            result = await rest(name, url, args, emit)
+            result = {'warm_rest_rtt': stats([]), 'rest_failures': 0, 'clock_offset_estimate_ms': None}
+            if args.rest:
+                print(f'{name}: REST 测试中...', flush=True)
+                result = await rest(name, url, args, emit)
             result['hosts'] = probes
             print(f'{name}: WebSocket 测试 {args.duration}s...', flush=True)
             result.update(await websocket(name, ws_template.format(symbol=args.symbol.lower()),
@@ -240,6 +266,9 @@ if __name__ == '__main__':
     parser.add_argument('--label', default=re.sub(r'[^a-zA-Z0-9_-]', '-', socket.gethostname()) or 'local',
                         help='云商和区域标签，默认本机主机名，例如 aws-tokyo-az1')
     parser.add_argument('--duration', type=int, default=300, help='每个交易所 WS 采样秒数')
+    parser.add_argument('--rest', action='store_true', help='额外测试 REST；默认只做域名传输诊断和 WS 实测')
+    parser.add_argument('--binance-ws-url', help='自定义币安公开 aggTrade WSS 地址，可含 {symbol}')
+    parser.add_argument('--aster-ws-url', help='自定义 Aster 公开 aggTrade WSS 地址，可含 {symbol}')
     parser.add_argument('--samples', type=int, default=60, help='REST 请求次数（含首个冷请求）')
     parser.add_argument('--interval', type=float, default=1, help='REST 请求间隔秒数')
     parser.add_argument('--symbol', default='BTCUSDT')
@@ -249,4 +278,7 @@ if __name__ == '__main__':
         parser.error('duration >= 1, samples >= 2, interval >= 0.2')
     if not args.label or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in args.label):
         parser.error('label 只允许字母、数字、连字符和下划线')
+    for value in (args.binance_ws_url, args.aster_ws_url):
+        if value and (not value.startswith('wss://') or '@' in value.split('/')[2]):
+            parser.error('自定义地址必须是无凭据的 wss:// 公开行情入口')
     asyncio.run(main(args))
