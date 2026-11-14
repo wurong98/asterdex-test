@@ -82,3 +82,13 @@ Aster:   wss://fstream.asterdex.com/ws/btcusdt@aggTrade
 ```
 
 可用 `--binance-ws-url`、`--aster-ws-url` 覆盖为实际策略使用的公开 aggTrade 流地址（可用 `{symbol}` 占位符）。当前解析器仅统计 aggTrade，其他类型消息不计为有效行情。请勿输入带 listenKey、签名等敏感参数的账户流地址，URL 会写入本地结果。WS 发单接口与行情接口也可能位于不同网关；本工具不测 WS 发单。
+
+## 5～10 秒快速筛选
+
+```bash
+./run.sh --fast                              # 默认 8 秒
+./run.sh --fast --duration 5 --label aws-tokyo
+./run.sh --fast --duration 10 --label aws-singapore
+```
+
+两个交易所同时测，跳过四域名前置 HTTPS 诊断及 REST，仅连接实际 WS（仍会正常解析其域名）。每秒一个协议 Ping，显示握手、Ping 样本数/P50/最大值、行情数和错误数。握手计入时限，关闭连接最多额外约 1 秒；首次安装依赖另计。无法连接也会输出错误及空样本。短测用于排除明显慢的机器，小样本 P95/P99 不代表长期稳定性；入围机器再跑长测。

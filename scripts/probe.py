@@ -151,8 +151,10 @@ async def websocket(name, url, args, offset, emit):
             last = None
             started = time.perf_counter()
             try:
-                async with session.ws_connect(url, autoping=False,
-                                              timeout=aiohttp.ClientWSTimeout(ws_close=5)) as ws:
+                async with await asyncio.wait_for(
+                        session.ws_connect(url, autoping=False,
+                            timeout=aiohttp.ClientWSTimeout(ws_close=1 if args.fast else 5)),
+                        max(0.001, deadline-time.monotonic())) as ws:
                     handshake = (time.perf_counter()-started)*1000
                     handshakes.append(handshake)
                     emit({'kind': 'ws_connected', 'exchange': name,
@@ -165,7 +167,7 @@ async def websocket(name, url, args, offset, emit):
                             token = str(time.perf_counter_ns()).encode()
                             pending = {token: time.perf_counter()}
                             await ws.ping(token)
-                            next_ping = now_mono+5
+                            next_ping = now_mono+(1 if args.fast else 5)
                         try:
                             msg = await asyncio.wait_for(ws.receive(), max(0.001, min(next_ping-time.monotonic(), deadline-time.monotonic())))
                         except asyncio.TimeoutError:
@@ -244,7 +246,8 @@ async def main(args):
             url, ws_template = TARGETS[name]
             ws_template = getattr(args, name+'_ws_url') or ws_template
             hosts = (url.split('/')[2], ws_template.split('/')[2])
-            probes = dict(zip(hosts, await asyncio.gather(*(host_probe(h, name, emit) for h in hosts))))
+            probes = {} if args.fast else dict(zip(hosts, await asyncio.gather(
+                *(host_probe(h, name, emit) for h in hosts))))
             result = {'warm_rest_rtt': stats([]), 'rest_failures': 0, 'clock_offset_estimate_ms': None}
             if args.rest:
                 print(f'{name}: REST 测试中...', flush=True)
@@ -257,7 +260,16 @@ async def main(args):
         results = dict(await asyncio.gather(*(venue(n) for n in TARGETS)))
     summary = {'metadata': metadata, 'results': results}
     (folder/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n')
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if args.fast:
+        print('交易所 | WS握手ms | Ping样本 | Ping P50ms | Ping最大ms | 行情数 | 错误数')
+        for name, r in results.items():
+            ping = r['ws_ping_rtt']
+            print(f"{name} | {r['ws_handshake'].get('p50_ms', 'NA')} | {ping['n']} | "
+                  f"{ping.get('p50_ms', 'NA')} | {ping.get('max_ms', 'NA')} | "
+                  f"{r['ws_messages']} | {r['ws_errors']}")
+        print('快速初筛：小样本不能代表长期稳定性；完整分位数保存在 summary.json。')
+    else:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f'结果目录: {folder}')
 
 
@@ -265,7 +277,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--label', default=re.sub(r'[^a-zA-Z0-9_-]', '-', socket.gethostname()) or 'local',
                         help='云商和区域标签，默认本机主机名，例如 aws-tokyo-az1')
-    parser.add_argument('--duration', type=int, default=300, help='每个交易所 WS 采样秒数')
+    parser.add_argument('--fast', action='store_true', help='8秒 WS 快筛，跳过前置探测，每秒 Ping')
+    parser.add_argument('--duration', type=int, default=None, help='WS 总测试秒数（含握手）；默认300，fast默认8')
     parser.add_argument('--rest', action='store_true', help='额外测试 REST；默认只做域名传输诊断和 WS 实测')
     parser.add_argument('--binance-ws-url', help='自定义币安公开 aggTrade WSS 地址，可含 {symbol}')
     parser.add_argument('--aster-ws-url', help='自定义 Aster 公开 aggTrade WSS 地址，可含 {symbol}')
@@ -274,6 +287,10 @@ if __name__ == '__main__':
     parser.add_argument('--symbol', default='BTCUSDT')
     parser.add_argument('--output', default='results')
     args = parser.parse_args()
+    if args.duration is None:
+        args.duration = 8 if args.fast else 300
+    if args.fast and args.rest:
+        parser.error('--fast 不与 --rest 同时使用，以保证快速完成')
     if args.duration < 1 or args.samples < 2 or args.interval < 0.2:
         parser.error('duration >= 1, samples >= 2, interval >= 0.2')
     if not args.label or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in args.label):
