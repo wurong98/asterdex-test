@@ -22,6 +22,8 @@ git clone https://github.com/wurong98/asterdex-test.git && cd asterdex-test && .
 ./run.sh --label aws-tokyo --duration 1800 --samples 200
 ```
 
+首先对 `fapi.binance.com`、`fstream.binance.com`、`fapi.asterdex.com`、`fstream.asterdex.com` 四个域名单独执行 DNS 和最多三次 HTTPS 探测（遭拒绝或限流提前停止），记录连接 IP、TCP（含本次 DNS）和 TLS 耗时、HTTP 状态、CDN 响应头；根路径状态仅用于传输诊断，403/404 不代表有效接口可用。详情也写入 summary.json 的 hosts 字段。
+
 默认两个交易所并行测试，各自先采样 60 次 REST，再接收 300 秒 BTCUSDT 聚合成交。默认总耗时约 6 分钟，网络超时会延长。虚拟环境仅创建在项目内；关闭环境代理，测直接公网路径。参数 `--symbol ETHUSDT` 可换币对。
 
 ## 结果

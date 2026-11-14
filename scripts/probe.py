@@ -7,6 +7,7 @@ import math
 import platform
 import re
 import socket
+import ssl
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -49,6 +50,53 @@ async def dns(host):
                 'lookup_ms': (time.perf_counter()-start)*1000}
     except Exception as e:
         return {'host': host, 'error': str(e)}
+
+
+async def host_probe(host, name, emit):
+    resolution = await dns(host)
+    emit({'kind': 'dns', 'exchange': name, **resolution})
+    print(f"{host}: DNS {resolution.get('ips', resolution.get('error'))}", flush=True)
+    attempts = []
+    for i in range(3):
+        row = {'kind': 'host_https', 'exchange': name, 'host': host, 'sample': i}
+        writer = None
+        stage = 'tcp'
+        try:
+            start = time.perf_counter()
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, 443), 8)
+            row['tcp_with_dns_ms'] = (time.perf_counter()-start)*1000
+            row['remote_ip'] = writer.get_extra_info('peername')[0]
+            stage = 'tls'
+            tls_start = time.perf_counter()
+            await asyncio.wait_for(writer.start_tls(ssl.create_default_context(), server_hostname=host), 8)
+            row['tls_handshake_ms'] = (time.perf_counter()-tls_start)*1000
+            stage = 'http'
+            writer.write(f'GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: region-probe/1\r\n\r\n'.encode())
+            await writer.drain()
+            header = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 8)
+            lines = header.decode('iso-8859-1').split('\r\n')
+            row['http_status_line'] = lines[0]
+            row['headers_total_ms'] = (time.perf_counter()-start)*1000
+            row['headers'] = {k.strip().lower(): v.strip() for line in lines[1:] if ':' in line
+                              for k, v in [line.split(':', 1)]
+                              if k.strip().lower() in ('server', 'via', 'x-amz-cf-pop', 'cf-ray')}
+            row['transport_ok'] = True
+            print(f"{host}: {row['remote_ip']} {lines[0]} TCP含DNS={row['tcp_with_dns_ms']:.1f}ms TLS={row['tls_handshake_ms']:.1f}ms", flush=True)
+        except Exception as e:
+            row.update(transport_ok=False, failed_stage=stage, error=repr(e))
+            print(f'{host}: {stage} 失败 {e!r}', flush=True)
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), 2)
+                except Exception:
+                    pass
+        emit(row)
+        attempts.append(row)
+        if row.get('http_status_line', '').split(' ')[1:2] in (['403'], ['418'], ['429'], ['451']):
+            break
+    return {'dns': resolution, 'https_attempts': attempts}
 
 
 async def rest(name, url, args, emit):
@@ -171,10 +219,11 @@ async def main(args):
         emit({'kind': 'metadata', **metadata})
         async def venue(name):
             url, ws_template = TARGETS[name]
-            for host in (url.split('/')[2], ws_template.split('/')[2]):
-                emit({'kind': 'dns', 'exchange': name, **await dns(host)})
+            hosts = (url.split('/')[2], ws_template.split('/')[2])
+            probes = dict(zip(hosts, await asyncio.gather(*(host_probe(h, name, emit) for h in hosts))))
             print(f'{name}: REST 测试中...', flush=True)
             result = await rest(name, url, args, emit)
+            result['hosts'] = probes
             print(f'{name}: WebSocket 测试 {args.duration}s...', flush=True)
             result.update(await websocket(name, ws_template.format(symbol=args.symbol.lower()),
                                           args, result['clock_offset_estimate_ms'], emit))
