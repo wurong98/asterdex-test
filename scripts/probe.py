@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Public endpoint measurements; never sends orders or uses credentials."""
+import argparse
+import asyncio
+import json
+import math
+import platform
+import re
+import socket
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import aiohttp
+
+TARGETS = {
+    'binance': ('https://fapi.binance.com/fapi/v1/time',
+                'wss://fstream.binance.com/market/ws/{symbol}@aggTrade'),
+    'aster': ('https://fapi.asterdex.com/fapi/v3/time',
+              'wss://fstream.asterdex.com/ws/{symbol}@aggTrade'),
+}
+
+
+def stats(values):
+    if not values:
+        return {'n': 0}
+    v = sorted(values)
+    return {'n': len(v), 'min_ms': round(v[0], 3),
+            **{f'p{p}_ms': round(v[max(0, math.ceil(len(v)*p/100)-1)], 3)
+               for p in (50, 95, 99)}, 'max_ms': round(v[-1], 3)}
+
+
+def clock_status():
+    try:
+        p = subprocess.run(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'],
+                           capture_output=True, text=True, timeout=3)
+        return p.stdout.strip() if p.returncode == 0 else 'unknown'
+    except (OSError, subprocess.TimeoutExpired):
+        return 'unknown'
+
+
+async def dns(host):
+    start = time.perf_counter()
+    try:
+        info = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
+            host, 443, type=socket.SOCK_STREAM), 8)
+        return {'host': host, 'ips': sorted({x[4][0] for x in info}),
+                'lookup_ms': (time.perf_counter()-start)*1000}
+    except Exception as e:
+        return {'host': host, 'error': str(e)}
+
+
+async def rest(name, url, args, emit):
+    rows, offsets, failures = [], [], 0
+    async with aiohttp.ClientSession(trust_env=False,
+            timeout=aiohttp.ClientTimeout(total=8)) as session:
+        for i in range(args.samples):
+            start, wall = time.perf_counter(), time.time()*1000
+            row = {'kind': 'rest', 'exchange': name, 'sample': i,
+                   'first_request': i == 0, 'url': url}
+            try:
+                async with session.get(url, allow_redirects=False) as r:
+                    body = await r.text()
+                    elapsed = (time.perf_counter()-start)*1000
+                    row.update(status=r.status, rtt_ms=elapsed,
+                               headers={k: v for k, v in r.headers.items()
+                                        if k.lower() in ('server', 'via', 'x-amz-cf-pop', 'cf-ray')})
+                    try:
+                        server_time = json.loads(body).get('serverTime')
+                    except (ValueError, AttributeError):
+                        server_time = None
+                    if r.status == 200 and isinstance(server_time, (int, float)):
+                        row['valid'] = True
+                        row['clock_offset_estimate_ms'] = server_time - (wall+elapsed/2)
+                        offsets.append((elapsed, row['clock_offset_estimate_ms']))
+                        if i > 0:
+                            rows.append(elapsed)
+                    else:
+                        failures += 1
+                        row.update(valid=False, body_preview=body[:300])
+                    emit(row)
+                    if r.status in (403, 418, 429, 451):
+                        emit({'kind': 'rest_stopped', 'exchange': name,
+                              'reason': f'HTTP {r.status}; no repeated blocked/rate-limited requests'})
+                        break
+            except Exception as e:
+                failures += 1
+                emit({**row, 'valid': False, 'error': repr(e)})
+            await asyncio.sleep(args.interval)
+    return {'warm_rest_rtt': stats(rows), 'rest_failures': failures,
+            'clock_offset_estimate_ms': min(offsets)[1] if offsets else None}
+
+
+async def websocket(name, url, args, offset, emit):
+    ages, gaps, handshakes = [], [], []
+    count, disconnects, attempts = 0, 0, 0
+    deadline = time.monotonic()+args.duration
+    async with aiohttp.ClientSession(trust_env=False,
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=8)) as session:
+        while time.monotonic() < deadline:
+            attempts += 1
+            last = None
+            started = time.perf_counter()
+            try:
+                async with session.ws_connect(url, heartbeat=20, autoping=True,
+                                              timeout=aiohttp.ClientWSTimeout(ws_close=5)) as ws:
+                    handshake = (time.perf_counter()-started)*1000
+                    handshakes.append(handshake)
+                    emit({'kind': 'ws_connected', 'exchange': name,
+                          'url': url, 'handshake_ms': handshake})
+                    while time.monotonic() < deadline:
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), min(15, deadline-time.monotonic()))
+                        except asyncio.TimeoutError:
+                            if time.monotonic() >= deadline:
+                                break
+                            emit({'kind': 'ws_idle', 'exchange': name, 'seconds': 15})
+                            continue
+                        now, wall = time.perf_counter(), time.time()*1000
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                                data = data.get('data', data)
+                                if data.get('e') != 'aggTrade':
+                                    continue
+                                event = data.get('E')
+                            except (ValueError, AttributeError):
+                                continue
+                            count += 1
+                            row = {'kind': 'ws_event', 'exchange': name, 'received_ms': wall,
+                                   'event_ms': event, 'trade_id': data.get('a')}
+                            if last is not None:
+                                gap = (now-last)*1000
+                                gaps.append(gap)
+                                row['interarrival_ms'] = gap
+                            last = now
+                            if isinstance(event, (int, float)):
+                                row['raw_event_age_ms'] = wall-event
+                                if offset is not None:
+                                    age = wall+offset-event
+                                    ages.append(age)
+                                    row['estimated_event_age_ms'] = age
+                            emit(row)
+                        elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED,
+                                          aiohttp.WSMsgType.ERROR):
+                            raise ConnectionError(f'websocket closed: {ws.close_code}, {ws.exception()}')
+            except Exception as e:
+                disconnects += 1
+                emit({'kind': 'ws_error', 'exchange': name, 'error': repr(e)})
+                if isinstance(e, aiohttp.WSServerHandshakeError) and e.status in (403, 418, 429, 451):
+                    break
+                await asyncio.sleep(min(3, max(0, deadline-time.monotonic())))
+    return {'ws_messages': count, 'ws_data_received': count > 0, 'ws_attempts': attempts, 'ws_errors': disconnects,
+            'ws_handshake': stats(handshakes), 'ws_interarrival': stats(gaps),
+            'estimated_event_age': stats(ages)}
+
+
+async def main(args):
+    folder = Path(args.output)/f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{args.label}"
+    folder.mkdir(parents=True, exist_ok=False)
+    with (folder/'raw.jsonl').open('w') as raw:
+        def emit(row):
+            raw.write(json.dumps({'utc': datetime.now(timezone.utc).isoformat(), **row})+'\n')
+            raw.flush()
+        metadata = {'label': args.label, 'utc': datetime.now(timezone.utc).isoformat(),
+                    'platform': platform.platform(), 'ntp_synchronized': clock_status(),
+                    'parameters': vars(args), 'proxy': 'disabled',
+                    'limitations': 'Public endpoints only. Not order latency or engine location. '
+                    'Event age uses uncertain midpoint clock estimate; interarrival includes market activity.'}
+        emit({'kind': 'metadata', **metadata})
+        async def venue(name):
+            url, ws_template = TARGETS[name]
+            for host in (url.split('/')[2], ws_template.split('/')[2]):
+                emit({'kind': 'dns', 'exchange': name, **await dns(host)})
+            print(f'{name}: REST 测试中...', flush=True)
+            result = await rest(name, url, args, emit)
+            print(f'{name}: WebSocket 测试 {args.duration}s...', flush=True)
+            result.update(await websocket(name, ws_template.format(symbol=args.symbol.lower()),
+                                          args, result['clock_offset_estimate_ms'], emit))
+            return name, result
+        results = dict(await asyncio.gather(*(venue(n) for n in TARGETS)))
+    summary = {'metadata': metadata, 'results': results}
+    (folder/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n')
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f'结果目录: {folder}')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--label', default=re.sub(r'[^a-zA-Z0-9_-]', '-', socket.gethostname()) or 'local',
+                        help='云商和区域标签，默认本机主机名，例如 aws-tokyo-az1')
+    parser.add_argument('--duration', type=int, default=300, help='每个交易所 WS 采样秒数')
+    parser.add_argument('--samples', type=int, default=60, help='REST 请求次数（含首个冷请求）')
+    parser.add_argument('--interval', type=float, default=1, help='REST 请求间隔秒数')
+    parser.add_argument('--symbol', default='BTCUSDT')
+    parser.add_argument('--output', default='results')
+    args = parser.parse_args()
+    if args.duration < 1 or args.samples < 2 or args.interval < 0.2:
+        parser.error('duration >= 1, samples >= 2, interval >= 0.2')
+    if not args.label or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in args.label):
+        parser.error('label 只允许字母、数字、连字符和下划线')
+    asyncio.run(main(args))
